@@ -7,6 +7,8 @@ declare namespace Cloudflare {
 	}
 	interface Env {
 		VALUE_FROM_CLOUDFLARE: "Hello from Hono/CF";
+		AI: Ai;
+		KV: KvNamespace;
 	}
 }
 interface Env extends Cloudflare.Env {}
@@ -8396,4 +8398,26 @@ declare abstract class WorkflowInstance {
         type: string;
         payload: unknown;
     }): Promise<void>;
+}
+
+
+declare module "virtual:react-router/server-build" {
+  import type { ServerBuild } from "@react-router/dev/server-build";
+  const serverBuild: ServerBuild;
+  export default serverBuild;
+}
+
+declare module "app/+types/root" {
+  export interface LinksFunction {
+    (): Array<{ rel: string; href: string; crossOrigin?: string }>;
+  }
+  
+  export interface ErrorBoundaryProps {
+    error: unknown;
+  }
+  
+  export namespace Route {
+    export type LinksFunction = LinksFunction;
+    export type ErrorBoundaryProps = ErrorBoundaryProps;
+  }
 }

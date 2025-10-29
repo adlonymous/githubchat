@@ -1,8 +1,11 @@
 import { Hono } from "hono";
 import { createRequestHandler } from "react-router";
 import type { RepoInfo } from "../app/types/repo";
+import { chunkCode, extractTextContent } from "./utils/chunking";
+import { generateEmbeddings, embedQuery } from "./utils/embeddings";
+import { retrieveSimilarChunks, formatChunksAsContext } from "./utils/retrieval";
 
-const app = new Hono<{ Bindings: { AI: any; KV: KVNamespace } }>();
+const app = new Hono<{ Bindings: { AI: any; KV: KVNamespace; VECTORIZE: VectorizeIndex } }>();
 
 // Helper function to extract owner/repo from GitHub URL
 function parseGitHubUrl(url: string): { owner: string; repo: string } | null {
@@ -53,19 +56,67 @@ app.post("/api/chat", async (c) => {
 			return c.json({ error: "Message and repoUrl are required" }, 400);
 		}
 
+		const parsed = parseGitHubUrl(repoUrl);
+		if (!parsed) {
+			return c.json({ error: "Invalid GitHub URL" }, 400);
+		}
+
+		const repoId = `${parsed.owner}/${parsed.repo}`;
+
+		// Check if repository is indexed and retrieve relevant chunks
+		const indexStatus = await c.env.KV.get(`index:${repoId}`);
+		const isIndexed = indexStatus === "indexed";
+		
+		let codeContext = "";
+		let retrievedChunks: any[] = [];
+		
+		if (isIndexed) {
+			try {
+				const queryEmbedding = await embedQuery(message, c.env.AI);
+				const firstRetrieval = await retrieveSimilarChunks(
+					queryEmbedding,
+					c.env.VECTORIZE,
+					repoId,
+					5
+				);
+				retrievedChunks = firstRetrieval;
+				codeContext = formatChunksAsContext(firstRetrieval);
+			} catch (error) {
+				console.error("Retrieval error:", error);
+			}
+		}
+
 		// Create a system prompt that includes repository context
-		const systemPrompt = `You are an AI assistant specialized in analyzing GitHub repositories. You help developers understand codebases, answer questions about code structure, dependencies, architecture, and provide insights about the repository.
+		let systemPrompt = `You are an AI assistant specialized in analyzing GitHub repositories. You help developers understand codebases, answer questions about code structure, dependencies, architecture, and provide insights about the repository.
 
 Current Repository: ${repoUrl}
 
+`;
+
+		if (codeContext) {
+			systemPrompt += `IMPORTANT: Code context is available below. Use it to answer questions accurately with specific file paths and line numbers when relevant.
+
 Instructions:
-- Be helpful and informative about the repository
-- If asked about specific files or code, explain what you would need to analyze them
+- Use the provided code context to answer questions accurately
+- Reference specific files and line numbers from the code context
+- If you need more information, say so explicitly - the system will retrieve additional context
 - Provide insights about common patterns, best practices, or potential improvements
-- If you don't have access to the actual repository content, explain what analysis would be possible with repository access
 - Keep responses concise but comprehensive
-- Focus on practical, actionable advice
-- When asked questions not about this repository, give a small response limited to two sentences, and say that you are not an expert in it and that the person should ask somewhere else.`;
+- Focus on practical, actionable advice`;
+		} else if (isIndexed) {
+			systemPrompt += `The repository is indexed but no relevant code snippets were found for this query. Answer based on general knowledge about the repository if possible.`;
+		} else {
+			systemPrompt += `IMPORTANT: The repository code is currently being indexed. You don't have access to the actual source code yet, so you can only provide general information about GitHub repositories or wait until indexing completes.
+
+Instructions:
+- Inform the user that the repository is still being indexed
+- Suggest they wait a moment for indexing to complete, or ask general questions about the repository
+- Once indexing is complete, you'll be able to provide specific code references`;
+		}
+
+		const userMessageWithContext = codeContext
+			? `${message}\n\n${codeContext}`
+			: message;
 
 		// Prepare messages for the AI model
 		const messages = [
@@ -73,22 +124,70 @@ Instructions:
 				role: "system" as const,
 				content: systemPrompt,
 			},
-			...(conversationHistory || []).slice(-10), // Keep last 10 messages for context
+			...(conversationHistory || []).slice(-8), // Keep last 8 messages for context
 			{
 				role: "user" as const,
-				content: message,
+				content: userMessageWithContext,
 			},
 		];
 
-		// Call Workers AI
-		const response = await c.env.AI.run("@cf/meta/llama-3.1-8b-instruct", {
+		// First AI call
+		const firstResponse = await c.env.AI.run("@cf/meta/llama-3.1-8b-instruct", {
 			messages,
 			max_tokens: 1000,
 			temperature: 0.7,
 		});
 
+		let finalResponse = firstResponse.response;
+
+		// Check if AI needs more information and do second retrieval
+		const needsMoreContext = /need more|don't have|can't find|not available|missing|insufficient/i.test(firstResponse.response);
+
+		if (needsMoreContext && isIndexed && retrievedChunks.length > 0) {
+			try {
+				const queryEmbedding = await embedQuery(message, c.env.AI);
+				const secondRetrieval = await retrieveSimilarChunks(
+					queryEmbedding,
+					c.env.VECTORIZE,
+					repoId,
+					10
+				);
+
+				const firstChunkIds = new Set(retrievedChunks.map(c => c.chunk.filePath + c.chunk.startLine));
+				const additionalChunks = secondRetrieval.filter(
+					r => !firstChunkIds.has(r.chunk.filePath + r.chunk.startLine)
+				);
+
+				if (additionalChunks.length > 0) {
+					const additionalContext = formatChunksAsContext(additionalChunks);
+					
+					const secondMessages = [
+						...messages,
+						{
+							role: "assistant" as const,
+							content: firstResponse.response,
+						},
+						{
+							role: "user" as const,
+							content: `Here is additional code context:\n\n${additionalContext}\n\nPlease provide a more complete answer.`,
+						},
+					];
+
+					const secondResponse = await c.env.AI.run("@cf/meta/llama-3.1-8b-instruct", {
+						messages: secondMessages,
+						max_tokens: 1500,
+						temperature: 0.7,
+					});
+
+					finalResponse = secondResponse.response;
+				}
+			} catch (error) {
+				console.error("Second retrieval error:", error);
+			}
+		}
+
 		return c.json({
-			response: response.response,
+			response: finalResponse,
 			success: true,
 		});
 	} catch (error) {
@@ -96,6 +195,189 @@ Instructions:
 		return c.json(
 			{ 
 				error: "Failed to process chat message",
+				details: error instanceof Error ? error.message : "Unknown error"
+			}, 
+			500
+		);
+	}
+});
+
+// Helper function to recursively fetch repository tree
+async function fetchRepositoryTree(
+	owner: string,
+	repo: string,
+	sha: string = "HEAD",
+	path: string = ""
+): Promise<Array<{ path: string; type: string; sha: string }>> {
+	const url = path
+		? `https://api.github.com/repos/${owner}/${repo}/contents/${path}?ref=${sha}`
+		: `https://api.github.com/repos/${owner}/${repo}/contents?ref=${sha}`;
+
+	const response = await fetch(url, {
+		headers: {
+			"Accept": "application/vnd.github.v3+json",
+			"User-Agent": "githubchat-app",
+		},
+	});
+
+	if (!response.ok) {
+		throw new Error(`GitHub API error: ${response.status}`);
+	}
+
+	const items: Array<{ path: string; type: string; sha: string; url?: string; size?: number }> = await response.json();
+	const result: Array<{ path: string; type: string; sha: string }> = [];
+
+	for (const item of items) {
+		if (item.type === "file") {
+			// Only process code files
+			const codeExtensions = /\.(js|ts|jsx|tsx|py|java|cpp|c|h|go|rs|rb|php|swift|kt|md|json|yaml|yml|xml|html|css|scss|less)$/i;
+			if (codeExtensions.test(item.path) && (!item.size || item.size < 100000)) {
+				// Skip large files
+				result.push({
+					path: item.path,
+					type: item.type,
+					sha: item.sha,
+				});
+			}
+		} else if (item.type === "dir") {
+			// Recursively fetch subdirectories
+			const subItems = await fetchRepositoryTree(owner, repo, sha, item.path);
+			result.push(...subItems);
+		}
+	}
+
+	return result;
+}
+
+// Helper function to fetch file contents
+async function fetchFileContent(
+	owner: string,
+	repo: string,
+	path: string,
+	sha: string
+): Promise<string | null> {
+	const url = `https://api.github.com/repos/${owner}/${repo}/git/blobs/${sha}`;
+	const response = await fetch(url, {
+		headers: {
+			"Accept": "application/vnd.github.v3+json",
+			"User-Agent": "githubchat-app",
+		},
+	});
+
+	if (!response.ok) {
+		return null;
+	}
+
+	const data = await response.json() as { encoding?: string; content?: string };
+	if (data.encoding === "base64" && data.content) {
+		try {
+			return atob(data.content.replace(/\n/g, ""));
+		} catch {
+			return null;
+		}
+	}
+	return data.content || null;
+}
+
+// Index repository endpoint
+app.post("/api/repo/index", async (c) => {
+	try {
+		const { repoUrl } = await c.req.json();
+		
+		if (!repoUrl) {
+			return c.json({ error: "repoUrl is required" }, 400);
+		}
+
+		const parsed = parseGitHubUrl(repoUrl);
+		if (!parsed) {
+			return c.json({ error: "Invalid GitHub URL" }, 400);
+		}
+
+		const { owner, repo } = parsed;
+		const repoId = `${owner}/${repo}`;
+
+		// Check if already indexed
+		const indexStatus = await c.env.KV.get(`index:${repoId}`);
+		if (indexStatus === "indexed") {
+			return c.json({ 
+				success: true, 
+				message: "Repository already indexed",
+				repoId 
+			});
+		}
+
+		// Get default branch
+		const repoResponse = await fetch(`https://api.github.com/repos/${owner}/${repo}`, {
+			headers: {
+				"Accept": "application/vnd.github.v3+json",
+				"User-Agent": "githubchat-app",
+			},
+		});
+
+		if (!repoResponse.ok) {
+			return c.json({ error: "Repository not found" }, 404);
+		}
+
+		const repoData = await repoResponse.json() as { default_branch: string };
+		const defaultBranch = repoData.default_branch;
+
+		// Fetch repository tree
+		const files = await fetchRepositoryTree(owner, repo, defaultBranch);
+		
+		// Limit to first 100 files for initial indexing
+		const filesToProcess = files.slice(0, 100);
+		
+		// Process files in batches
+		const allChunks = [];
+		for (const file of filesToProcess) {
+			const content = await fetchFileContent(owner, repo, file.path, file.sha);
+			if (content) {
+				const textContent = extractTextContent(content, file.path);
+				if (textContent) {
+					const chunks = chunkCode(textContent, file.path);
+					allChunks.push(...chunks);
+				}
+			}
+		}
+
+		// Generate embeddings
+		const embeddings = await generateEmbeddings(allChunks, c.env.AI, repoId);
+
+		// Store in Vectorize
+		const vectors = embeddings.map((emb) => ({
+			id: emb.id,
+			values: emb.embedding,
+			metadata: {
+				...emb.chunk,
+				repoId,
+			},
+		}));
+
+		// Batch upsert into Vectorize
+		if (vectors.length > 0) {
+			// Vectorize batch upsert - we'll do it in batches of 100
+			const batchSize = 100;
+			for (let i = 0; i < vectors.length; i += batchSize) {
+				const batch = vectors.slice(i, i + batchSize);
+				await c.env.VECTORIZE.upsert(batch);
+			}
+		}
+
+		// Mark as indexed
+		await c.env.KV.put(`index:${repoId}`, "indexed");
+
+		return c.json({
+			success: true,
+			message: "Repository indexed successfully",
+			chunksIndexed: embeddings.length,
+			filesProcessed: filesToProcess.length,
+			repoId,
+		});
+	} catch (error) {
+		console.error("Indexing error:", error);
+		return c.json(
+			{ 
+				error: "Failed to index repository",
 				details: error instanceof Error ? error.message : "Unknown error"
 			}, 
 			500
@@ -211,7 +493,8 @@ app.post("/api/repo/info", async (c) => {
 	}
 });
 
-app.get("*", (c) => {
+// Catch-all route for React Router - must be last
+app.all("*", async (c) => {
 	const requestHandler = createRequestHandler(
 		() => import("virtual:react-router/server-build"),
 		import.meta.env.MODE,

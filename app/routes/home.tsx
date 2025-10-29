@@ -11,8 +11,10 @@ export function meta() {
 	];
 }
 
-export function loader({ context }: { context: any }) {
-	return { message: context.cloudflare.env.VALUE_FROM_CLOUDFLARE };
+export function loader({ context }: { context?: any }) {
+	return { 
+		message: context?.cloudflare?.env?.VALUE_FROM_CLOUDFLARE || "Welcome to GitHub Repository Analyzer" 
+	};
 }
 
 export default function Home({ loaderData }: { loaderData: any }) {

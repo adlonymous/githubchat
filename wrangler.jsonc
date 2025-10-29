@@ -23,6 +23,12 @@
 			"id": "1ef7e7948ed242f6a1fe0d52269ca6f7",
 		}
 	],
+	"vectorize": [
+		{
+			"binding": "VECTORIZE",
+			"index_name": "code-embeddings"
+		}
+	],
 	"observability": {
 		"enabled": true
 	},

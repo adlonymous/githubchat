@@ -22,6 +22,8 @@ export function ChatInterface() {
   const [inputValue, setInputValue] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [isLoadingRepo, setIsLoadingRepo] = useState(true);
+  const [isIndexing, setIsIndexing] = useState(false);
+  const [indexingStatus, setIndexingStatus] = useState<string>("");
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   // Load repo info and chat history on mount
@@ -40,6 +42,13 @@ export function ChatInterface() {
           const data = await response.json();
           if (data.success) {
             setRepoInfo(data.data);
+            
+            // Trigger indexing in the background (non-blocking)
+            fetch("/api/repo/index", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ repoUrl: decodedRepoUrl }),
+            }).catch(err => console.error("Indexing failed:", err));
             
             // Try to load existing chat history
             const history = getChatHistoryByRepo(decodedRepoUrl);
